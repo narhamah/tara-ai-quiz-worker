@@ -2362,6 +2362,12 @@ export default {
 
     try {
       const url = new URL(request.url);
+
+      /* /api/transcribe accepts multipart form-data (audio blob), not JSON */
+      if (url.pathname === "/api/transcribe") {
+        return handleTranscribe(request, env);
+      }
+
       const body = await request.json();
 
       if (url.pathname === "/api/question") {
@@ -2380,6 +2386,50 @@ export default {
     }
   },
 };
+
+async function handleTranscribe(request, env) {
+  if (!env.OPENAI_API_KEY) return errorResponse("OPENAI_API_KEY is not configured.", 500, env);
+
+  let formData;
+  try {
+    formData = await request.formData();
+  } catch (e) {
+    return errorResponse("Expected multipart form-data with an 'audio' field.", 400, env);
+  }
+
+  const audioFile = formData.get("audio");
+  if (!audioFile || !(audioFile instanceof File || audioFile instanceof Blob)) {
+    return errorResponse("Missing 'audio' field in form-data.", 400, env);
+  }
+
+  /* Forward to OpenAI Whisper transcription */
+  const openaiForm = new FormData();
+  const fileName = audioFile.name || "voice.webm";
+  openaiForm.append("file", audioFile, fileName);
+  openaiForm.append("model", String(env.OPENAI_TRANSCRIPTION_MODEL || "whisper-1"));
+  openaiForm.append("response_format", "json");
+  openaiForm.append("language", "en");
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: openaiForm,
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error("OpenAI transcription error:", response.status, errText);
+      return errorResponse("Transcription failed.", response.status >= 500 ? 502 : 400, env);
+    }
+
+    const result = await response.json();
+    return jsonResponse({ text: result.text || "" }, 200, env);
+  } catch (error) {
+    console.error("Transcription request error:", error);
+    return errorResponse("Transcription service unavailable.", 502, env);
+  }
+}
 
 function corsHeaders(env) {
   return {
