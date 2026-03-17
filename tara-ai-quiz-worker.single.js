@@ -2363,16 +2363,22 @@ export default {
     try {
       const url = new URL(request.url);
 
-      /* /api/transcribe accepts multipart form-data (audio blob), not JSON */
+      if (url.pathname === "/api/question") {
+        /* Accept either JSON or multipart (when voice note is attached) */
+        const contentType = request.headers.get("Content-Type") || "";
+        if (contentType.includes("multipart/form-data")) {
+          return handleQuestionWithAudio(request, env);
+        }
+        const body = await request.json();
+        return handleQuestion(body, env);
+      }
+
+      /* /api/transcribe — standalone transcription (kept for backward compat) */
       if (url.pathname === "/api/transcribe") {
         return handleTranscribe(request, env);
       }
 
       const body = await request.json();
-
-      if (url.pathname === "/api/question") {
-        return handleQuestion(body, env);
-      }
       if (url.pathname === "/api/assessment") {
         return handleAssessment(body, env);
       }
@@ -3081,6 +3087,83 @@ function getDefaultQuestionResponse(state, candidateIds, history) {
 function positiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+async function handleQuestionWithAudio(request, env) {
+  if (!env.OPENAI_API_KEY) return errorResponse("OPENAI_API_KEY is not configured.", 500, env);
+
+  let formData;
+  try {
+    formData = await request.formData();
+  } catch (e) {
+    return errorResponse("Expected multipart form-data.", 400, env);
+  }
+
+  const audioFile = formData.get("audio");
+  const payloadRaw = formData.get("payload");
+  if (!payloadRaw) return errorResponse("Missing 'payload' field.", 400, env);
+
+  let body;
+  try {
+    body = JSON.parse(payloadRaw);
+  } catch (e) {
+    return errorResponse("Invalid JSON in 'payload' field.", 400, env);
+  }
+
+  /* Transcribe the audio via Whisper if present */
+  let voiceTranscript = "";
+  if (audioFile && (audioFile instanceof File || audioFile instanceof Blob) && audioFile.size > 0) {
+    try {
+      const openaiForm = new FormData();
+      const fileName = audioFile.name || "voice.webm";
+      openaiForm.append("file", audioFile, fileName);
+      openaiForm.append("model", String(env.OPENAI_TRANSCRIPTION_MODEL || "whisper-1"));
+      openaiForm.append("response_format", "json");
+      openaiForm.append("language", "en");
+
+      const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+        body: openaiForm,
+      });
+
+      if (whisperRes.ok) {
+        const result = await whisperRes.json();
+        voiceTranscript = (result.text || "").trim();
+      } else {
+        console.error("Whisper transcription failed:", whisperRes.status, await whisperRes.text().catch(() => ""));
+      }
+    } catch (err) {
+      console.error("Whisper request error:", err);
+    }
+  }
+
+  /* Inject transcribed text into the last conversation turn (the voice_note turn) */
+  const history = body.conversation_history || [];
+  if (voiceTranscript && history.length > 0) {
+    const lastTurn = history[history.length - 1];
+    if (lastTurn.input_type === "voice_note") {
+      lastTurn.answer = voiceTranscript;
+      lastTurn.answer_label = voiceTranscript;
+    }
+  }
+  body.conversation_history = history;
+
+  /* Process as normal question */
+  const response = await handleQuestion(body, env);
+
+  /* Attach transcript to the response so frontend can sync */
+  if (voiceTranscript) {
+    try {
+      const responseBody = await response.json();
+      responseBody._voice_transcript = voiceTranscript;
+      return jsonResponse(responseBody, response.status, env);
+    } catch (e) {
+      return response;
+    }
+  }
+
+  return response;
 }
 
 async function handleQuestion(body, env) {
